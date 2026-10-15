@@ -1,23 +1,6 @@
 import sql from 'mssql';
-import mysql from 'mysql2/promise';
 import env from '../config/env.js';
-const isMssql = env.database.port === 1433 || process.env.DATABASE_CLIENT === 'mssql';
-let mysqlPool = null;
 let mssqlPool = null;
-if (!isMssql) {
-    mysqlPool = mysql.createPool({
-        host: env.database.host,
-        port: env.database.port,
-        database: env.database.name,
-        user: env.database.user,
-        password: env.database.password,
-        waitForConnections: true,
-        connectionLimit: env.database.poolSize,
-        queueLimit: 0,
-        ssl: env.database.ssl ? { rejectUnauthorized: true } : undefined,
-        timezone: 'Z',
-    });
-}
 const getMssqlPool = async () => {
     if (!mssqlPool || !mssqlPool.connected) {
         mssqlPool = await new sql.ConnectionPool({
@@ -40,7 +23,6 @@ const getMssqlPool = async () => {
     }
     return mssqlPool;
 };
-export const sqlNow = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
 const TABLE_NAMES = [
     'workspace_members', 'project_members', 'board_members', 'board_columns', 'task_assignees',
     'task_labels', 'task_checklist_items', 'task_checklists', 'task_comments',
@@ -69,34 +51,18 @@ export const execute = async (query, values = []) => {
         }
         return val;
     });
-    if (isMssql) {
-        const pool = await getMssqlPool();
-        const request = pool.request();
-        let pIdx = 0;
-        const transformed = transformForMssql(query);
-        const sqlText = transformed.replace(/\?/g, () => `@p${pIdx++}`);
-        sanitizedValues.forEach((val, idx) => {
-            request.input(`p${idx}`, val === undefined ? null : val);
-        });
-        const result = await request.query(sqlText);
-        return (result.recordset || []);
-    }
-    if (!mysqlPool)
-        throw new Error('MySQL pool not initialized');
-    const [rows] = await mysqlPool.execute(query, sanitizedValues);
-    return rows;
+    const pool = await getMssqlPool();
+    const request = pool.request();
+    let pIdx = 0;
+    const sqlText = transformForMssql(query).replace(/\?/g, () => `@p${pIdx++}`);
+    sanitizedValues.forEach((val, idx) => {
+        request.input(`p${idx}`, val === undefined ? null : val);
+    });
+    const result = await request.query(sqlText);
+    return (result.recordset || []);
 };
-export const getConnection = async () => {
-    if (isMssql) {
-        return getMssqlPool();
-    }
-    if (!mysqlPool)
-        throw new Error('MySQL pool not initialized');
-    return mysqlPool.getConnection();
-};
+export const getConnection = getMssqlPool;
 export const poolEnd = async () => {
     if (mssqlPool)
         await mssqlPool.close();
-    if (mysqlPool)
-        await mysqlPool.end();
 };

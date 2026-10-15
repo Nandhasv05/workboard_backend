@@ -8,15 +8,14 @@ import env from './config/env.js';
 import { errorHandler, notFound } from './middleware/errors.js';
 import { authenticate } from './middleware/auth.js';
 import { authRouter } from './routes/auth.js';
-import { workspaceRouter } from './routes/workspaces.js';
 import { projectRouter } from './routes/projects.js';
 import { boardRouter } from './routes/boards.js';
 import { taskRouter } from './routes/tasks.js';
-import { reportRouter } from './routes/reports.js';
 import { notificationRouter } from './routes/notifications.js';
 export const createApp = () => {
     const app = express();
     app.disable('x-powered-by');
+    app.set('trust proxy', 'loopback');
     app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
     app.use(cors({ origin: true, credentials: true }));
     app.use(express.json({ limit: '50mb' }));
@@ -29,11 +28,9 @@ export const createApp = () => {
     app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 200, standardHeaders: true, legacyHeaders: false }));
     app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'orbit-api', timestamp: new Date().toISOString() }));
     app.use('/api/auth', authRouter);
-    app.use('/api/workspaces', authenticate, workspaceRouter);
     app.use('/api/projects', authenticate, projectRouter);
     app.use('/api/boards', authenticate, boardRouter);
     app.use('/api/tasks', authenticate, taskRouter);
-    app.use('/api/reports', authenticate, reportRouter);
     app.use('/api/notifications', authenticate, notificationRouter);
     app.use(notFound);
     app.use(errorHandler);

@@ -93,7 +93,7 @@ const TEMPLATE_CONFIGS: Record<string, {
   }
 };
 
-export const createBoard = async (input: BoardInput) => {
+export const createBoard = async (input: BoardInput, creatorId?: string) => {
   const id = randomUUID();
   const now = new Date().toISOString();
   
@@ -116,6 +116,10 @@ export const createBoard = async (input: BoardInput) => {
     [id, projectId, input.name, input.background ?? null, visibility, accessCode, templateKey ?? null, now, now]
   );
   
+  if (creatorId) {
+    await execute('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [id, creatorId, 'owner', now]);
+  }
+
   const board = (await execute('SELECT * FROM boards WHERE id = ?', [id]))[0];
   await initializeColumns(id, templateKey, projectId);
   return board;
@@ -123,14 +127,35 @@ export const createBoard = async (input: BoardInput) => {
 
 export const listBoards = async (projectId?: string) => {
   if (projectId) {
-    return await execute('SELECT b.*, p.name as project_name FROM boards b JOIN projects p ON p.id = b.project_id WHERE b.project_id = ? ORDER BY b.updated_at DESC', [projectId]);
+    return withoutAccessCode(await execute('SELECT b.*, p.name as project_name FROM boards b JOIN projects p ON p.id = b.project_id WHERE b.project_id = ? ORDER BY b.updated_at DESC', [projectId]));
   }
-  return await execute('SELECT b.*, p.name as project_name FROM boards b JOIN projects p ON p.id = b.project_id ORDER BY b.updated_at DESC');
+  return withoutAccessCode(await execute('SELECT b.*, p.name as project_name FROM boards b JOIN projects p ON p.id = b.project_id ORDER BY b.updated_at DESC'));
 };
 
-export const getBoard = async (id: string) => {
+const withoutAccessCode = (boards: any[]) => boards.map(({ access_code: _code, ...board }) => board);
+
+const BOARD_ADMIN_ROLES = ['admin', 'it_admin', 'superadmin'];
+
+/** Private boards open only for their members and portal admins; everyone else must enter the access code. */
+export const canOpenBoard = async (boardId: string, userId?: string) => {
+  const board = (await execute<{ visibility: string | null }>('SELECT visibility FROM boards WHERE id = ?', [boardId]))[0];
+  if (!board || board.visibility !== 'private') return true;
+  if (!userId) return false;
+  const me = (await execute<{ role: string | null; is_member: number }>(
+    'SELECT u.role, CASE WHEN EXISTS (SELECT 1 FROM board_members bm WHERE bm.board_id = ? AND bm.user_id = u.id) THEN 1 ELSE 0 END AS is_member FROM users u WHERE u.id = ?',
+    [boardId, userId]
+  ))[0];
+  return !!me && (me.is_member === 1 || BOARD_ADMIN_ROLES.includes((me.role || '').toLowerCase()));
+};
+
+export const getBoard = async (id: string, userId?: string) => {
   const board = (await execute<{ id: string; project_id: string; name: string; background?: string; visibility?: string; access_code?: string; template?: string; created_at: string; updated_at: string }>('SELECT * FROM boards WHERE id = ?', [id]))[0];
   if (!board) throw new HttpError(404, 'Board not found');
+
+  if (!(await canOpenBoard(id, userId))) {
+    const { access_code: _code, ...summary } = board;
+    return { ...summary, locked: true, columns: [], members: [] };
+  }
   
   const columns = await execute<{ id: string; board_id: string; name: string; position: number; color: string; created_at: string; updated_at: string }>('SELECT * FROM board_columns WHERE board_id = ? ORDER BY position', [id]);
   const tasks = await execute<{ id: string; column_id: string; position: number }>('SELECT * FROM tasks WHERE board_id = ? ORDER BY position', [id]);
@@ -145,7 +170,7 @@ export const getBoard = async (id: string) => {
   };
 };
 
-export const verifyBoardAccess = async (id: string, accessCode: string) => {
+export const verifyBoardAccess = async (id: string, accessCode: string, userId?: string) => {
   const board = (await execute<{ id: string; visibility: string; access_code: string }>('SELECT id, visibility, access_code FROM boards WHERE id = ?', [id]))[0];
   if (!board) throw new HttpError(404, 'Board not found');
   
@@ -156,7 +181,13 @@ export const verifyBoardAccess = async (id: string, accessCode: string) => {
   const cleanProvided = (accessCode || '').trim().toUpperCase();
   const cleanStored = (board.access_code || '').trim().toUpperCase();
 
-  if (cleanProvided === cleanStored) {
+  if (cleanStored && cleanProvided === cleanStored) {
+    if (userId) {
+      const existing = await execute('SELECT 1 FROM board_members WHERE board_id = ? AND user_id = ?', [id, userId]);
+      if (existing.length === 0) {
+        await execute('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [id, userId, 'member', new Date().toISOString()]);
+      }
+    }
     return { success: true, message: 'Access granted' };
   }
 
@@ -165,7 +196,7 @@ export const verifyBoardAccess = async (id: string, accessCode: string) => {
 
 export const listBoardMembers = async (boardId: string) => {
   return await execute(`
-    SELECT bm.board_id, bm.user_id, bm.role, bm.created_at, u.name, u.email, u.avatar_url
+    SELECT bm.board_id, bm.user_id, bm.role, bm.created_at, u.name, u.username, u.email, u.department, u.emp_code, u.avatar_url
     FROM board_members bm
     JOIN users u ON u.id = bm.user_id
     WHERE bm.board_id = ?
@@ -178,6 +209,25 @@ export const addBoardMember = async (boardId: string, userId: string, role = 'me
   if (existing.length === 0) {
     const now = new Date().toISOString();
     await execute('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [boardId, userId, role, now]);
+
+    // Send email notification to new member
+    try {
+      const [boardRows, userRows] = await Promise.all([
+        execute<{ name: string }>('SELECT name FROM boards WHERE id = ?', [boardId]),
+        execute<{ email: string; name: string }>('SELECT email, name FROM users WHERE id = ?', [userId]),
+      ]);
+      if (userRows[0]?.email && boardRows[0]?.name) {
+        const { sendBoardMemberEmail } = await import('./emailService.js');
+        sendBoardMemberEmail({
+          to: userRows[0].email,
+          recipientName: userRows[0].name || 'Team Member',
+          boardName: boardRows[0].name,
+          role,
+        }).catch(err => console.warn('[Email] Board invitation email error:', err?.message));
+      }
+    } catch (e) {
+      console.warn('[Email] Failed to send board member email:', e);
+    }
   }
   return await listBoardMembers(boardId);
 };
@@ -360,6 +410,7 @@ export const copyBoard = async (sourceId: string, newName: string, keepCards = t
 };
 
 export const deleteBoard = async (id: string) => {
+  await execute('DELETE FROM board_members WHERE board_id = ?', [id]);
   await execute('DELETE FROM boards WHERE id = ?', [id]);
   return { success: true };
 };

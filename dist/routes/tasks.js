@@ -4,12 +4,17 @@ import fs from 'fs';
 import path from 'path';
 import { HttpError } from '../middleware/errors.js';
 import { createTask, deleteTask, listTasks, moveTask, updateTask, getTaskDetails, addComment, addChecklist, addChecklistItem, toggleChecklistItem, deleteChecklistItem, deleteChecklist, addAttachment, deleteAttachment, getUserInbox } from '../services/taskService.js';
+import { canOpenBoard } from '../services/boardService.js';
 export const taskRouter = Router();
 taskRouter.get('/inbox/summary', async (req, res) => {
     const userId = req.user?.id || '1';
     res.json(await getUserInbox(userId));
 });
 taskRouter.get('/', async (req, res) => {
+    const boardId = req.query.boardId;
+    if (boardId && !(await canOpenBoard(boardId, req.user?.id))) {
+        throw new HttpError(403, 'This board is private. Enter the access code to open it.');
+    }
     res.json({ tasks: await listTasks(req.query.projectId, req.query.boardId) });
 });
 taskRouter.get('/:id', param('id').isUUID(), async (req, res) => {
@@ -64,7 +69,7 @@ taskRouter.post('/:id/attachments', param('id').isUUID(), async (req, res) => {
         buffer = Buffer.from(dataUrl, 'base64');
     }
     fs.writeFileSync(filePath, buffer);
-    const fileUrl = `/uploads/${safeName}`;
+    const fileUrl = `/Workboard/TodoList/uploads/${safeName}`;
     const userId = req.user?.id || '1';
     const attachment = await addAttachment(id, userId, fileName || cleanName, mime, buffer.length, fileUrl);
     res.status(201).json({ attachment });

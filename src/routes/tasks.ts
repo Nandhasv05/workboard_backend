@@ -9,6 +9,7 @@ import {
   toggleChecklistItem, deleteChecklistItem, deleteChecklist,
   addAttachment, deleteAttachment, getUserInbox
 } from '../services/taskService.js';
+import { canOpenBoard } from '../services/boardService.js';
 
 export const taskRouter = Router();
 
@@ -18,6 +19,10 @@ taskRouter.get('/inbox/summary', async (req, res) => {
 });
 
 taskRouter.get('/', async (req, res) => {
+  const boardId = req.query.boardId as string | undefined;
+  if (boardId && !(await canOpenBoard(boardId, (req as any).user?.id))) {
+    throw new HttpError(403, 'This board is private. Enter the access code to open it.');
+  }
   res.json({ tasks: await listTasks(req.query.projectId as string, req.query.boardId as string) });
 });
 
@@ -87,7 +92,7 @@ taskRouter.post('/:id/attachments', param('id').isUUID(), async (req, res) => {
   }
 
   fs.writeFileSync(filePath, buffer);
-  const fileUrl = `/uploads/${safeName}`;
+  const fileUrl = `/Workboard/TodoList/uploads/${safeName}`;
   const userId = (req as any).user?.id || '1';
 
   const attachment = await addAttachment(id, userId, fileName || cleanName, mime, buffer.length, fileUrl);

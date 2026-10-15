@@ -17,12 +17,12 @@ boardRouter.get('/', async (req, res) => {
 
 boardRouter.get('/:id', param('id').isUUID(), async (req, res) => {
   const id = (req.params as { id: string }).id;
-  res.json({ board: await getBoard(id) });
+  res.json({ board: await getBoard(id, (req as any).user?.id) });
 });
 
 boardRouter.post('/:id/verify-access', param('id').isUUID(), async (req, res) => {
   const id = (req.params as { id: string }).id;
-  const result = await verifyBoardAccess(id, req.body.accessCode);
+  const result = await verifyBoardAccess(id, req.body.accessCode, (req as any).user?.id);
   res.json(result);
 });
 
@@ -64,7 +64,7 @@ boardRouter.post('/', body('projectId').optional().isString(), body('name').trim
   if (!errors.isEmpty()) throw new HttpError(400, errors.array()[0]?.msg ?? 'Invalid input');
   next();
 }, async (req, res) => {
-  res.status(201).json({ board: await createBoard(req.body) });
+  res.status(201).json({ board: await createBoard(req.body, (req as any).user?.id) });
 });
 
 boardRouter.post('/columns', body('boardId').isString().notEmpty(), body('name').trim().isLength({ min: 1, max: 160 }), async (req, res) => {

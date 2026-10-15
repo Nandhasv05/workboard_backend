@@ -1,26 +1,7 @@
 import sql from 'mssql';
-import mysql from 'mysql2/promise';
 import env from '../config/env.js';
 
-const isMssql = env.database.port === 1433 || process.env.DATABASE_CLIENT === 'mssql';
-
-let mysqlPool: mysql.Pool | null = null;
 let mssqlPool: sql.ConnectionPool | null = null;
-
-if (!isMssql) {
-  mysqlPool = mysql.createPool({
-    host: env.database.host,
-    port: env.database.port,
-    database: env.database.name,
-    user: env.database.user,
-    password: env.database.password,
-    waitForConnections: true,
-    connectionLimit: env.database.poolSize,
-    queueLimit: 0,
-    ssl: env.database.ssl ? { rejectUnauthorized: true } : undefined,
-    timezone: 'Z',
-  });
-}
 
 const getMssqlPool = async (): Promise<sql.ConnectionPool> => {
   if (!mssqlPool || !mssqlPool.connected) {
@@ -76,35 +57,21 @@ export const execute = async <T>(query: string, values: unknown[] = []): Promise
     return val;
   });
 
-  if (isMssql) {
-    const pool = await getMssqlPool();
-    const request = pool.request();
-    let pIdx = 0;
-    const transformed = transformForMssql(query);
-    const sqlText = transformed.replace(/\?/g, () => `@p${pIdx++}`);
+  const pool = await getMssqlPool();
+  const request = pool.request();
+  let pIdx = 0;
+  const sqlText = transformForMssql(query).replace(/\?/g, () => `@p${pIdx++}`);
 
-    sanitizedValues.forEach((val, idx) => {
-      request.input(`p${idx}`, val === undefined ? null : val);
-    });
+  sanitizedValues.forEach((val, idx) => {
+    request.input(`p${idx}`, val === undefined ? null : val);
+  });
 
-    const result = await request.query(sqlText);
-    return (result.recordset || []) as T[];
-  }
-
-  if (!mysqlPool) throw new Error('MySQL pool not initialized');
-  const [rows] = await mysqlPool.execute(query, sanitizedValues as never[]);
-  return rows as T[];
+  const result = await request.query(sqlText);
+  return (result.recordset || []) as T[];
 };
 
-export const getConnection = async () => {
-  if (isMssql) {
-    return getMssqlPool();
-  }
-  if (!mysqlPool) throw new Error('MySQL pool not initialized');
-  return mysqlPool.getConnection();
-};
+export const getConnection = getMssqlPool;
 
 export const poolEnd = async () => {
   if (mssqlPool) await mssqlPool.close();
-  if (mysqlPool) await mysqlPool.end();
 };

@@ -18,9 +18,27 @@ export const createTask = async (userId, input) => {
     for (const assigneeId of input.assigneeIds ?? []) {
         if (assigneeId) {
             await execute('INSERT INTO task_assignees (task_id, user_id, created_at) VALUES (?, ?, ?)', [id, assigneeId, now]);
+            try {
+                const userRows = await execute('SELECT email, name FROM users WHERE id = ?', [assigneeId]);
+                if (userRows[0]?.email) {
+                    const { sendTaskAssignmentEmail } = await import('./emailService.js');
+                    sendTaskAssignmentEmail({
+                        to: userRows[0].email,
+                        recipientName: userRows[0].name || 'Team Member',
+                        taskTitle: input.title,
+                        dueDate: input.dueDate || undefined,
+                    }).catch(err => console.warn('[Email] Task assignment email error:', err?.message));
+                }
+            }
+            catch (e) {
+                console.warn('[Email] Failed to trigger assignee email:', e);
+            }
         }
     }
     await logTaskActivity(id, userId, 'created this card');
+    if (input.description && input.description.includes('@')) {
+        handleMentionsInText(input.description, id, userId, 'description').catch(e => console.warn('[Mention]', e));
+    }
     return (await execute('SELECT * FROM tasks WHERE id = ?', [id]))[0];
 };
 export const updateTask = async (id, input) => {
@@ -44,19 +62,30 @@ export const updateTask = async (id, input) => {
     }
     if (input.description !== undefined && input.description !== cur.description) {
         await logTaskActivity(id, userId, 'updated description');
+        if (input.description && input.description.includes('@')) {
+            handleMentionsInText(input.description, id, userId, 'description').catch(e => console.warn('[Mention]', e));
+        }
     }
     if (input.dueDate !== undefined && input.dueDate !== cur.due_date) {
         await logTaskActivity(id, userId, 'updated due date');
     }
-    // Handle Assignees
-    if (Array.isArray(input.assigneeIds)) {
+    // Handle Assignees safely
+    const rawAssignees = input.assigneeIds !== undefined ? input.assigneeIds : input.assignee_ids;
+    if (rawAssignees !== undefined) {
+        let assigneeList = [];
+        if (Array.isArray(rawAssignees)) {
+            assigneeList = rawAssignees.map((a) => typeof a === 'string' ? a : a.id || a.user_id).filter(Boolean);
+        }
+        else if (typeof rawAssignees === 'string' && rawAssignees.trim()) {
+            assigneeList = rawAssignees.split(',').map((s) => s.trim()).filter(Boolean);
+        }
         const existingAssignees = await execute('SELECT user_id FROM task_assignees WHERE task_id = ?', [id]);
         const existingSet = new Set(existingAssignees.map(a => a.user_id));
         await execute('DELETE FROM task_assignees WHERE task_id = ?', [id]);
         const now = new Date().toISOString();
         const taskTitle = title;
         const boardName = cur.board_name || 'Board';
-        for (const uid of input.assigneeIds) {
+        for (const uid of assigneeList) {
             if (uid) {
                 await execute('INSERT INTO task_assignees (task_id, user_id, created_at) VALUES (?, ?, ?)', [id, uid, now]);
                 // Generate notification for newly assigned member
@@ -64,16 +93,39 @@ export const updateTask = async (id, input) => {
                     const notifId = randomUUID();
                     await execute('INSERT INTO notifications (id, user_id, type, title, message, created_at) VALUES (?, ?, ?, ?, ?, ?)', [notifId, uid, 'task_assigned', `Task Assigned: ${taskTitle}`, `You have been assigned to card "${taskTitle}" in board "${boardName}"`, now]);
                     await logTaskActivity(id, userId, 'assigned member');
+                    // Send email notification to newly assigned member
+                    try {
+                        const userRows = await execute('SELECT email, name FROM users WHERE id = ?', [uid]);
+                        if (userRows[0]?.email) {
+                            const { sendTaskAssignmentEmail } = await import('./emailService.js');
+                            sendTaskAssignmentEmail({
+                                to: userRows[0].email,
+                                recipientName: userRows[0].name || 'Team Member',
+                                taskTitle,
+                                boardName,
+                                dueDate: input.dueDate || cur.due_date,
+                            }).catch(err => console.warn('[Email] Task assignment email error:', err?.message));
+                        }
+                    }
+                    catch (e) {
+                        console.warn('[Email] Failed to trigger assignee email:', e);
+                    }
                 }
             }
         }
     }
-    // Handle Labels
-    if (Array.isArray(input.labels)) {
+    // Handle Labels safely whether passed as array of strings, array of objects, or comma string
+    const rawLabels = input.labels;
+    if (rawLabels !== undefined) {
+        let labelList = [];
+        if (Array.isArray(rawLabels)) {
+            labelList = rawLabels.map((l) => typeof l === 'string' ? l : l.name).filter(Boolean);
+        }
+        else if (typeof rawLabels === 'string' && rawLabels.trim()) {
+            labelList = rawLabels.split(',').map((s) => s.trim()).filter(Boolean);
+        }
         await execute('DELETE FROM task_labels WHERE task_id = ?', [id]);
-        for (const lbl of input.labels) {
-            const labelName = typeof lbl === 'string' ? lbl : lbl.name;
-            const labelColor = typeof lbl === 'object' && lbl.color ? lbl.color : '#0052cc';
+        for (const labelName of labelList) {
             if (!labelName)
                 continue;
             let existing = await execute('SELECT id FROM labels WHERE name = ?', [labelName]);
@@ -83,7 +135,7 @@ export const updateTask = async (id, input) => {
                 const now = new Date().toISOString();
                 const wsRows = await execute('SELECT id FROM workspaces');
                 const wsId = wsRows[0]?.id || '00000000-0000-0000-0000-000000000001';
-                await execute('INSERT INTO labels (id, workspace_id, name, color, created_at) VALUES (?, ?, ?, ?, ?)', [labelId, wsId, labelName, labelColor, now]);
+                await execute('INSERT INTO labels (id, workspace_id, name, color, created_at) VALUES (?, ?, ?, ?, ?)', [labelId, wsId, labelName, '#0052cc', now]);
             }
             await execute('INSERT INTO task_labels (task_id, label_id) VALUES (?, ?)', [id, labelId]);
         }
@@ -156,7 +208,7 @@ export const getTaskDetails = async (id) => {
     const task = taskRows[0];
     if (!task)
         throw new HttpError(404, 'Task not found');
-    const assignees = await execute('SELECT u.id, u.name, u.email, u.avatar_url FROM task_assignees ta JOIN users u ON u.id = ta.user_id WHERE ta.task_id = ?', [id]);
+    const assignees = await execute('SELECT u.id, u.name, u.username, u.email, u.department, u.avatar_url FROM task_assignees ta JOIN users u ON u.id = ta.user_id WHERE ta.task_id = ?', [id]);
     const labels = await execute('SELECT l.id, l.name, l.color FROM task_labels tl JOIN labels l ON l.id = tl.label_id WHERE tl.task_id = ?', [id]);
     const checklists = await execute('SELECT * FROM task_checklists WHERE task_id = ? ORDER BY created_at ASC', [id]);
     for (const checklist of checklists) {
@@ -181,6 +233,9 @@ export const addComment = async (taskId, userId, body) => {
     const now = new Date().toISOString();
     await execute('INSERT INTO task_comments (id, task_id, user_id, body, created_at) VALUES (?, ?, ?, ?, ?)', [id, taskId, userId || '1', body, now]);
     await logTaskActivity(taskId, userId, 'commented', { body });
+    if (body && body.includes('@')) {
+        handleMentionsInText(body, taskId, userId || '1', 'comment').catch(e => console.warn('[Mention]', e));
+    }
     return (await execute('SELECT tc.id, tc.body, tc.created_at, u.id as user_id, u.name as user_name, u.avatar_url FROM task_comments tc LEFT JOIN users u ON u.id = tc.user_id WHERE tc.id = ?', [id]))[0];
 };
 export const addChecklist = async (taskId, title, userId) => {
@@ -249,4 +304,45 @@ export const getUserInbox = async (userId) => {
     ORDER BY t.updated_at DESC
   `);
     return { assigned, recent };
+};
+export const handleMentionsInText = async (text, taskId, senderUserId, source) => {
+    if (!text)
+        return;
+    const matches = text.match(/@([a-zA-Z0-9._-]+)/g);
+    if (!matches)
+        return;
+    const usernames = Array.from(new Set(matches.map(m => m.slice(1).trim().toLowerCase())));
+    if (!usernames.length)
+        return;
+    const taskRows = await execute('SELECT t.title, b.name as board_name FROM tasks t LEFT JOIN boards b ON b.id = t.board_id WHERE t.id = ?', [taskId]);
+    const taskTitle = taskRows[0]?.title || 'Card';
+    const boardName = taskRows[0]?.board_name || 'Board';
+    const senderRows = await execute('SELECT name FROM users WHERE id = ?', [senderUserId]);
+    const senderName = senderRows[0]?.name || 'A team member';
+    for (const username of usernames) {
+        const userRows = await execute('SELECT id, name, email FROM users WHERE (LOWER(username) = ? OR LOWER(email) = ?) AND is_active = 1', [username, username]);
+        const targetUser = userRows[0];
+        if (targetUser && targetUser.email) {
+            const notifId = randomUUID();
+            const now = new Date().toISOString();
+            await execute('INSERT INTO notifications (id, user_id, type, title, message, created_at) VALUES (?, ?, ?, ?, ?, ?)', [
+                notifId,
+                targetUser.id,
+                'user_mentioned',
+                `Mentioned by ${senderName}`,
+                `${senderName} mentioned you in "${taskTitle}": "${text.slice(0, 120)}"`,
+                now
+            ]).catch(() => { });
+            const { sendMentionEmail } = await import('./emailService.js');
+            sendMentionEmail({
+                to: targetUser.email,
+                recipientName: targetUser.name || username,
+                mentionerName: senderName,
+                taskTitle,
+                boardName,
+                contextText: text,
+                source,
+            }).catch(err => console.warn('[Email] Mention notification error:', err?.message));
+        }
+    }
 };
