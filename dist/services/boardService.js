@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto';
 import { execute } from '../database/pool.js';
+import { applyRoleToBoard } from './permissionService.js';
 import { HttpError } from '../middleware/errors.js';
+import { accessMapForBoard, boardLevel } from './accessService.js';
 const TEMPLATE_CONFIGS = {
     hr: {
         columns: [
@@ -73,12 +74,11 @@ const TEMPLATE_CONFIGS = {
     }
 };
 export const createBoard = async (input, creatorId) => {
-    const id = randomUUID();
     const now = new Date().toISOString();
     let projectId = input.projectId;
     if (!projectId) {
         const defaultProj = await execute('SELECT id FROM projects ORDER BY created_at ASC');
-        projectId = defaultProj[0]?.id || '00000000-0000-0000-0000-000000000003';
+        projectId = defaultProj[0]?.id || 1;
     }
     const visibility = input.visibility === 'private' ? 'private' : 'public';
     let accessCode = input.accessCode?.trim() || null;
@@ -86,12 +86,13 @@ export const createBoard = async (input, creatorId) => {
         accessCode = `EVOL-${Math.floor(1000 + Math.random() * 9000)}`;
     }
     const templateKey = input.template?.toLowerCase();
-    await execute('INSERT INTO boards (id, project_id, name, background, visibility, access_code, template, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, projectId, input.name, input.background ?? null, visibility, accessCode, templateKey ?? null, now, now]);
+    const inserted = await execute('INSERT INTO boards (project_id, name, background, visibility, access_code, template, created_at, updated_at) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [projectId, input.name, input.background ?? null, visibility, accessCode, templateKey ?? null, now, now]);
+    const board = inserted[0];
+    const id = board.id;
     if (creatorId) {
         await execute('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [id, creatorId, 'owner', now]);
     }
-    const board = (await execute('SELECT * FROM boards WHERE id = ?', [id]))[0];
-    await initializeColumns(id, templateKey, projectId);
+    await initializeColumns(id, templateKey, projectId, input.columns);
     return board;
 };
 export const listBoards = async (projectId) => {
@@ -122,11 +123,19 @@ export const getBoard = async (id, userId) => {
     }
     const columns = await execute('SELECT * FROM board_columns WHERE board_id = ? ORDER BY position', [id]);
     const tasks = await execute('SELECT * FROM tasks WHERE board_id = ? ORDER BY position', [id]);
+    const access = await accessMapForBoard(id, userId, columns, tasks);
     // Also fetch board members
     const members = await listBoardMembers(id);
     return {
         ...board,
-        columns: columns.map(column => ({ ...column, tasks: tasks.filter(task => task.column_id === column.id) })),
+        my_access: await boardLevel(id, userId),
+        columns: columns
+            .filter(column => access.columnAccess[String(column.id)] !== 'none')
+            .map(column => ({
+            ...column,
+            my_access: access.columnAccess[String(column.id)],
+            tasks: tasks.filter(task => String(task.column_id) === String(column.id) && access.taskAccess[String(task.id)] !== 'none'),
+        })),
         members
     };
 };
@@ -161,8 +170,8 @@ export const listBoardMembers = async (boardId) => {
 };
 export const addBoardMember = async (boardId, userId, role = 'member') => {
     const existing = await execute('SELECT 1 FROM board_members WHERE board_id = ? AND user_id = ?', [boardId, userId]);
+    const now = new Date().toISOString();
     if (existing.length === 0) {
-        const now = new Date().toISOString();
         await execute('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [boardId, userId, role, now]);
         // Send email notification to new member
         try {
@@ -184,17 +193,71 @@ export const addBoardMember = async (boardId, userId, role = 'member') => {
             console.warn('[Email] Failed to send board member email:', e);
         }
     }
+    else {
+        await execute('UPDATE board_members SET role = ? WHERE board_id = ? AND user_id = ?', [role, boardId, userId]);
+    }
     return await listBoardMembers(boardId);
+};
+export const setBoardMembersAccess = async (boardId, members) => {
+    const now = new Date().toISOString();
+    for (const m of members) {
+        if (!m.role || m.role === 'none') {
+            await execute('DELETE FROM board_members WHERE board_id = ? AND user_id = ?', [boardId, m.userId]);
+            await applyRoleToBoard(boardId, m.userId, 'none');
+        }
+        else {
+            const existing = await execute('SELECT 1 FROM board_members WHERE board_id = ? AND user_id = ?', [boardId, m.userId]);
+            if (existing.length === 0) {
+                await execute('INSERT INTO board_members (board_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [boardId, m.userId, m.role, now]);
+            }
+            else {
+                await execute('UPDATE board_members SET role = ? WHERE board_id = ? AND user_id = ?', [m.role, boardId, m.userId]);
+            }
+            await applyRoleToBoard(boardId, m.userId, m.role);
+        }
+    }
+    return await listBoardMembers(boardId);
+};
+const MEMBER_COLUMNS = 'u.name, u.username, u.email, u.department, u.emp_code, u.avatar_url';
+export const listColumnMembers = async (columnId) => {
+    const own = await execute(`
+    SELECT cm.column_id, cm.user_id, cm.role, cm.created_at, ${MEMBER_COLUMNS}
+    FROM column_members cm JOIN users u ON u.id = cm.user_id
+    WHERE cm.column_id = ? ORDER BY cm.created_at ASC
+  `, [columnId]);
+    if (own.length > 0)
+        return { members: own, inherited: false };
+    const column = (await execute('SELECT board_id FROM board_columns WHERE id = ?', [columnId]))[0];
+    if (!column)
+        throw new HttpError(404, 'List not found');
+    return { members: await listBoardMembers(column.board_id), inherited: true };
+};
+export const setColumnMembersAccess = async (columnId, members) => {
+    const now = new Date().toISOString();
+    for (const member of members) {
+        if (!member.role || member.role === 'none') {
+            await execute('DELETE FROM column_members WHERE column_id = ? AND user_id = ?', [columnId, member.userId]);
+        }
+        else {
+            const existing = await execute('SELECT 1 FROM column_members WHERE column_id = ? AND user_id = ?', [columnId, member.userId]);
+            if (existing.length === 0) {
+                await execute('INSERT INTO column_members (column_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [columnId, member.userId, member.role, now]);
+            }
+            else {
+                await execute('UPDATE column_members SET role = ? WHERE column_id = ? AND user_id = ?', [member.role, columnId, member.userId]);
+            }
+        }
+    }
+    return await listColumnMembers(columnId);
 };
 export const removeBoardMember = async (boardId, userId) => {
     await execute('DELETE FROM board_members WHERE board_id = ? AND user_id = ?', [boardId, userId]);
     return await listBoardMembers(boardId);
 };
 export const createColumn = async (input) => {
-    const id = randomUUID();
     const now = new Date().toISOString();
-    await execute('INSERT INTO board_columns (id, board_id, name, position, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [id, input.boardId, input.name, input.position ?? 0, input.color ?? '#6c63ff', now, now]);
-    return (await execute('SELECT * FROM board_columns WHERE id = ?', [id]))[0];
+    const res = await execute('INSERT INTO board_columns (board_id, name, position, color, created_at, updated_at) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?)', [input.boardId, input.name, input.position ?? 0, input.color ?? '#6c63ff', now, now]);
+    return res[0];
 };
 export const updateColumn = async (id, name, color) => {
     const now = new Date().toISOString();
@@ -214,17 +277,17 @@ export const copyColumn = async (id) => {
     const cur = curRows[0];
     if (!cur)
         throw new HttpError(404, 'Column not found');
-    const newId = randomUUID();
     const now = new Date().toISOString();
     const newName = `${cur.name} (Copy)`;
     const newPos = (cur.position || 0) + 1;
-    await execute('INSERT INTO board_columns (id, board_id, name, position, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [newId, cur.board_id, newName, newPos, cur.color || '#6c63ff', now, now]);
+    const res = await execute('INSERT INTO board_columns (board_id, name, position, color, created_at, updated_at) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?)', [cur.board_id, newName, newPos, cur.color || '#6c63ff', now, now]);
+    const newCol = res[0];
+    const newId = newCol.id;
     const tasks = await execute('SELECT * FROM tasks WHERE column_id = ? ORDER BY position ASC', [id]);
     for (const t of tasks) {
-        const newTaskId = randomUUID();
-        await execute('INSERT INTO tasks (id, board_id, column_id, project_id, title, description, priority, start_date, due_date, due_time, due_reminder, recurring, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [newTaskId, t.board_id, newId, t.project_id, t.title, t.description ?? '', t.priority ?? 'medium', t.start_date ?? null, t.due_date ?? null, t.due_time ?? null, t.due_reminder ?? null, t.recurring ?? null, t.position ?? 0, now, now]);
+        await execute('INSERT INTO tasks (board_id, column_id, project_id, title, description, priority, start_date, due_date, due_time, due_reminder, recurring, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [t.board_id, newId, t.project_id, t.title, t.description ?? '', t.priority ?? 'medium', t.start_date ?? null, t.due_date ?? null, t.due_time ?? null, t.due_reminder ?? null, t.recurring ?? null, t.position ?? 0, now, now]);
     }
-    return (await execute('SELECT * FROM board_columns WHERE id = ?', [newId]))[0];
+    return newCol;
 };
 export const moveAllCardsInColumn = async (sourceId, targetId) => {
     const now = new Date().toISOString();
@@ -288,61 +351,45 @@ export const copyBoard = async (sourceId, newName, keepCards = true) => {
     const source = (await execute('SELECT * FROM boards WHERE id = ?', [sourceId]))[0];
     if (!source)
         throw new Error('Source board not found');
-    const newBoardId = randomUUID();
     const now = new Date().toISOString();
     let projectId = source.project_id;
     if (!projectId) {
         const defaultProj = (await execute('SELECT id FROM projects ORDER BY created_at ASC'));
-        projectId = defaultProj[0]?.id || '00000000-0000-0000-0000-000000000003';
+        projectId = defaultProj[0]?.id || 1;
     }
-    await execute('INSERT INTO boards (id, project_id, name, background, visibility, access_code, template, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [newBoardId, projectId, newName, source.background || null, source.visibility || 'public', source.access_code || null, source.template || null, now, now]);
+    const newBoardRes = await execute('INSERT INTO boards (project_id, name, background, visibility, access_code, template, created_at, updated_at) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [projectId, newName, source.background || null, source.visibility || 'public', source.access_code || null, source.template || null, now, now]);
+    const newBoard = newBoardRes[0];
+    const newBoardId = newBoard.id;
     const columns = (await execute('SELECT * FROM board_columns WHERE board_id = ? ORDER BY position ASC', [sourceId]));
     for (const col of columns) {
-        const newColId = randomUUID();
-        await execute('INSERT INTO board_columns (id, board_id, name, position, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [newColId, newBoardId, col.name, col.position || 0, col.color || '#6c63ff', now, now]);
+        const newColRes = await execute('INSERT INTO board_columns (board_id, name, position, color, created_at, updated_at) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?)', [newBoardId, col.name, col.position || 0, col.color || '#6c63ff', now, now]);
+        const newCol = newColRes[0];
+        const newColId = newCol.id;
         if (keepCards) {
             const cards = (await execute('SELECT * FROM tasks WHERE board_id = ? AND column_id = ?', [sourceId, col.id]));
             for (const card of cards) {
-                const newCardId = randomUUID();
-                await execute('INSERT INTO tasks (id, board_id, column_id, project_id, title, description, priority, start_date, due_date, due_time, due_reminder, recurring, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
-                    newCardId, newBoardId, newColId, projectId,
+                await execute('INSERT INTO tasks (board_id, column_id, project_id, title, description, priority, start_date, due_date, due_time, due_reminder, recurring, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+                    newBoardId, newColId, projectId,
                     card.title || 'Untitled', card.description || '', card.priority || 'medium',
                     card.start_date || null, card.due_date || null, card.due_time || null,
                     card.due_reminder || null, card.recurring || null, card.position || 0,
                     now, now
                 ]);
-                // Copy task assignees if any
-                try {
-                    const assignees = (await execute('SELECT user_id FROM task_assignees WHERE task_id = ?', [card.id]));
-                    for (const a of assignees) {
-                        await execute('INSERT INTO task_assignees (task_id, user_id, created_at) VALUES (?, ?, ?)', [newCardId, a.user_id, now]);
-                    }
-                }
-                catch {
-                    // ignore if table or column doesn't match
-                }
-                // Copy task checklists if any
-                try {
-                    const checklists = (await execute('SELECT * FROM task_checklists WHERE task_id = ? ORDER BY position ASC', [card.id]));
-                    for (const ch of checklists) {
-                        const newChId = randomUUID();
-                        await execute('INSERT INTO task_checklists (id, task_id, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [newChId, newCardId, ch.title || 'Checklist', ch.position || 0, now, now]);
-                        const items = (await execute('SELECT * FROM task_checklist_items WHERE checklist_id = ? ORDER BY position ASC', [ch.id]));
-                        for (const item of items) {
-                            const newItemId = randomUUID();
-                            await execute('INSERT INTO task_checklist_items (id, checklist_id, title, completed, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [newItemId, newChId, item.title || '', item.completed ? 1 : 0, item.position || 0, now, now]);
-                        }
-                    }
-                }
-                catch {
-                    // ignore if table doesn't exist
-                }
             }
         }
     }
-    return (await execute('SELECT * FROM boards WHERE id = ?', [newBoardId]))[0];
+    return newBoard;
 };
 export const deleteBoard = async (id) => {
+    const taskIds = 'SELECT id FROM tasks WHERE board_id = ?';
+    await execute(`DELETE FROM task_members WHERE task_id IN (${taskIds})`, [id]);
+    await execute(`DELETE FROM task_assignees WHERE task_id IN (${taskIds})`, [id]);
+    await execute(`DELETE FROM task_comments WHERE task_id IN (${taskIds})`, [id]);
+    await execute(`DELETE FROM task_attachments WHERE task_id IN (${taskIds})`, [id]);
+    await execute(`DELETE FROM task_activity_logs WHERE entity_id IN (SELECT CAST(id AS NVARCHAR(50)) FROM tasks WHERE board_id = ?)`, [id]);
+    await execute('DELETE FROM tasks WHERE board_id = ?', [id]);
+    await execute('DELETE FROM column_members WHERE column_id IN (SELECT id FROM board_columns WHERE board_id = ?)', [id]);
+    await execute('DELETE FROM board_columns WHERE board_id = ?', [id]);
     await execute('DELETE FROM board_members WHERE board_id = ?', [id]);
     await execute('DELETE FROM boards WHERE id = ?', [id]);
     return { success: true };
@@ -356,29 +403,32 @@ export const updateBoardVisibility = async (id, visibility, accessCode) => {
     await execute('UPDATE boards SET visibility = ?, access_code = ?, updated_at = ? WHERE id = ?', [visibility, code, now, id]);
     return (await execute('SELECT * FROM boards WHERE id = ?', [id]))[0];
 };
-const initializeColumns = async (boardId, templateKey, projectId) => {
+const initializeColumns = async (boardId, templateKey, projectId, customColumns) => {
     const templateConfig = templateKey && TEMPLATE_CONFIGS[templateKey] ? TEMPLATE_CONFIGS[templateKey] : null;
-    const colDefs = templateConfig ? templateConfig.columns : [
-        { name: 'Backlog', color: '#64748b' },
-        { name: 'To Do', color: '#2563eb' },
-        { name: 'In Progress', color: '#7c3aed' },
-        { name: 'Review', color: '#ea580c' },
-        { name: 'Testing', color: '#0891b2' },
-        { name: 'Completed', color: '#16a34a' }
-    ];
+    const colDefs = customColumns && customColumns.length > 0
+        ? customColumns.map((colName, index) => {
+            const colors = ['#2563eb', '#7c3aed', '#ea580c', '#0891b2', '#16a34a', '#059669', '#64748b'];
+            return { name: colName.trim(), color: colors[index % colors.length] };
+        })
+        : (templateConfig ? templateConfig.columns : [
+            { name: 'Backlog', color: '#64748b' },
+            { name: 'To Do', color: '#2563eb' },
+            { name: 'In Progress', color: '#7c3aed' },
+            { name: 'Review', color: '#ea580c' },
+            { name: 'Testing', color: '#0891b2' },
+            { name: 'Completed', color: '#16a34a' }
+        ]);
     const createdColIds = [];
     const now = new Date().toISOString();
     for (const [index, col] of colDefs.entries()) {
-        const colId = randomUUID();
-        await execute('INSERT INTO board_columns (id, board_id, name, position, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [colId, boardId, col.name, index, col.color, now, now]);
-        createdColIds.push(colId);
+        const colRes = await execute('INSERT INTO board_columns (board_id, name, position, color, created_at, updated_at) OUTPUT INSERTED.* VALUES (?, ?, ?, ?, ?, ?)', [boardId, col.name, index, col.color, now, now]);
+        createdColIds.push(colRes[0]?.id);
     }
     // If template has starter tasks, insert them
     if (templateConfig && templateConfig.starterTasks && projectId) {
         for (const [tIdx, t] of templateConfig.starterTasks.entries()) {
             const targetColId = createdColIds[t.colIdx] || createdColIds[0];
-            const taskId = randomUUID();
-            await execute('INSERT INTO tasks (id, board_id, column_id, project_id, title, description, priority, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [taskId, boardId, targetColId, projectId, t.title, `Initial starter task for ${t.title}`, t.priority, tIdx, now, now]);
+            await execute('INSERT INTO tasks (board_id, column_id, project_id, title, description, priority, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [boardId, targetColId, projectId, t.title, `Initial starter task for ${t.title}`, t.priority, tIdx, now, now]);
         }
     }
 };

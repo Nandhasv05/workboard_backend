@@ -39,8 +39,9 @@ CREATE TABLE todo.portal_users (
 );
 GO
 
--- Firstname/Lastname/Emailid/Empcode only exist on some CLIENT_API_LIVE copies.
--- Once todo.portal_users is populated, local dbo.users rows are kept only so old activity still resolves names.
+-- Dev reads todo.app_users (dbo.users on DATABASE_HOST).
+-- Production reads todo.portal_directory, filled from PORTAL_DB_HOST dbo.users.
+-- todo.users stays the dev directory so an older dev API keeps using DATABASE_HOST.
 DECLARE @nameExpr NVARCHAR(400) = CASE
   WHEN COL_LENGTH('dbo.users', 'Firstname') IS NOT NULL AND COL_LENGTH('dbo.users', 'Lastname') IS NOT NULL
     THEN N'COALESCE(NULLIF(LTRIM(RTRIM(CONCAT(u.Firstname, N'' '', u.Lastname))), N''''), u.UserName)'
@@ -53,7 +54,7 @@ DECLARE @empCodeExpr NVARCHAR(400) = CASE
   WHEN COL_LENGTH('dbo.users', 'Empcode') IS NOT NULL THEN N'CAST(u.Empcode AS NVARCHAR(50))'
   ELSE N'CAST(NULL AS NVARCHAR(50))' END;
 
-DECLARE @createView NVARCHAR(MAX) = N'CREATE OR ALTER VIEW todo.users AS
+DECLARE @createAppUsers NVARCHAR(MAX) = N'CREATE OR ALTER VIEW todo.app_users AS
 SELECT
   CAST(u.Id AS NVARCHAR(36)) COLLATE DATABASE_DEFAULT AS id,
   CAST(' + @nameExpr + N' AS NVARCHAR(512)) COLLATE DATABASE_DEFAULT AS name,
@@ -67,12 +68,29 @@ SELECT
   CAST(COALESCE(u.last_login_time, ''2026-01-01'') AS DATETIME2) AS created_at,
   CAST(COALESCE(u.last_login_time, ''2026-01-01'') AS DATETIME2) AS updated_at
 FROM dbo.Users u;';
-EXEC sp_executesql @createView;
+EXEC sp_executesql @createAppUsers;
+
+EXEC(N'CREATE OR ALTER VIEW todo.portal_directory AS
+SELECT
+  p.id,
+  CAST(COALESCE(NULLIF(LTRIM(RTRIM(CONCAT(ISNULL(p.first_name, N''''), N'' '', ISNULL(p.last_name, N'''')))), N''''), p.username) AS NVARCHAR(512)) COLLATE DATABASE_DEFAULT AS name,
+  CAST(p.username AS NVARCHAR(256)) COLLATE DATABASE_DEFAULT AS username,
+  CAST(p.email AS NVARCHAR(256)) COLLATE DATABASE_DEFAULT AS email,
+  CAST(LOWER(COALESCE(p.role, N''user'')) AS NVARCHAR(100)) COLLATE DATABASE_DEFAULT AS role,
+  CAST(p.department AS NVARCHAR(256)) COLLATE DATABASE_DEFAULT AS department,
+  CAST(p.emp_code AS NVARCHAR(100)) COLLATE DATABASE_DEFAULT AS emp_code,
+  p.is_active,
+  CAST(NULL AS NVARCHAR(500)) AS avatar_url,
+  CAST(COALESCE(p.last_login_time, p.synced_at, ''2026-01-01'') AS DATETIME2) AS created_at,
+  CAST(COALESCE(p.synced_at, ''2026-01-01'') AS DATETIME2) AS updated_at
+FROM todo.portal_users p;');
+
+EXEC(N'CREATE OR ALTER VIEW todo.users AS SELECT * FROM todo.app_users;');
 GO
 
 IF OBJECT_ID('todo.workspaces', 'U') IS NULL
 CREATE TABLE todo.workspaces (
-  id NVARCHAR(36) PRIMARY KEY,
+  id INT IDENTITY(1,1) PRIMARY KEY,
   name NVARCHAR(160) NOT NULL,
   description NVARCHAR(MAX) NULL,
   owner_id NVARCHAR(36) NOT NULL,
@@ -82,7 +100,7 @@ CREATE TABLE todo.workspaces (
 
 IF OBJECT_ID('todo.workspace_members', 'U') IS NULL
 CREATE TABLE todo.workspace_members (
-  workspace_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.workspaces(id) ON DELETE CASCADE,
+  workspace_id INT NOT NULL FOREIGN KEY REFERENCES todo.workspaces(id) ON DELETE CASCADE,
   user_id NVARCHAR(36) NOT NULL,
   role NVARCHAR(50) NOT NULL DEFAULT 'viewer',
   created_at DATETIME2(6) NOT NULL,
@@ -91,8 +109,8 @@ CREATE TABLE todo.workspace_members (
 
 IF OBJECT_ID('todo.projects', 'U') IS NULL
 CREATE TABLE todo.projects (
-  id NVARCHAR(36) PRIMARY KEY,
-  workspace_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.workspaces(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  workspace_id INT NOT NULL FOREIGN KEY REFERENCES todo.workspaces(id) ON DELETE CASCADE,
   name NVARCHAR(160) NOT NULL,
   code NVARCHAR(40) NOT NULL,
   description NVARCHAR(MAX) NULL,
@@ -110,7 +128,7 @@ CREATE TABLE todo.projects (
 
 IF OBJECT_ID('todo.project_members', 'U') IS NULL
 CREATE TABLE todo.project_members (
-  project_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.projects(id) ON DELETE CASCADE,
+  project_id INT NOT NULL FOREIGN KEY REFERENCES todo.projects(id) ON DELETE CASCADE,
   user_id NVARCHAR(36) NOT NULL,
   role NVARCHAR(50) NOT NULL DEFAULT 'viewer',
   created_at DATETIME2(6) NOT NULL,
@@ -119,16 +137,20 @@ CREATE TABLE todo.project_members (
 
 IF OBJECT_ID('todo.boards', 'U') IS NULL
 CREATE TABLE todo.boards (
-  id NVARCHAR(36) PRIMARY KEY,
-  project_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.projects(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  project_id INT NOT NULL FOREIGN KEY REFERENCES todo.projects(id) ON DELETE CASCADE,
   name NVARCHAR(160) NOT NULL,
+  background NVARCHAR(500) NULL,
+  visibility NVARCHAR(50) NOT NULL DEFAULT 'public',
+  access_code NVARCHAR(50) NULL,
+  template NVARCHAR(50) NULL,
   created_at DATETIME2(6) NOT NULL,
   updated_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME()
 );
 
 IF OBJECT_ID('todo.board_members', 'U') IS NULL
 CREATE TABLE todo.board_members (
-  board_id NVARCHAR(36) NOT NULL,
+  board_id INT NOT NULL FOREIGN KEY REFERENCES todo.boards(id) ON DELETE CASCADE,
   user_id NVARCHAR(36) NOT NULL,
   role NVARCHAR(50) NOT NULL DEFAULT 'member',
   created_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME(),
@@ -137,8 +159,8 @@ CREATE TABLE todo.board_members (
 
 IF OBJECT_ID('todo.board_columns', 'U') IS NULL
 CREATE TABLE todo.board_columns (
-  id NVARCHAR(36) PRIMARY KEY,
-  board_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.boards(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  board_id INT NOT NULL FOREIGN KEY REFERENCES todo.boards(id) ON DELETE CASCADE,
   name NVARCHAR(160) NOT NULL,
   position INT NOT NULL DEFAULT 0,
   color NVARCHAR(20) NOT NULL DEFAULT '#6c63ff',
@@ -148,15 +170,18 @@ CREATE TABLE todo.board_columns (
 
 IF OBJECT_ID('todo.tasks', 'U') IS NULL
 CREATE TABLE todo.tasks (
-  id NVARCHAR(36) PRIMARY KEY,
-  board_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.boards(id) ON DELETE CASCADE,
-  column_id NVARCHAR(36) NULL FOREIGN KEY REFERENCES todo.board_columns(id) ON DELETE NO ACTION,
-  project_id NVARCHAR(36) NOT NULL,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  board_id INT NOT NULL FOREIGN KEY REFERENCES todo.boards(id) ON DELETE CASCADE,
+  column_id INT NULL FOREIGN KEY REFERENCES todo.board_columns(id) ON DELETE NO ACTION,
+  project_id INT NOT NULL,
   title NVARCHAR(240) NOT NULL,
   description NVARCHAR(MAX) NULL,
   priority NVARCHAR(50) NOT NULL DEFAULT 'medium',
   start_date DATE NULL,
   due_date DATE NULL,
+  due_time NVARCHAR(20) NULL,
+  due_reminder NVARCHAR(50) NULL,
+  recurring NVARCHAR(50) NULL,
   position INT NOT NULL DEFAULT 0,
   created_at DATETIME2(6) NOT NULL,
   updated_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME()
@@ -164,7 +189,7 @@ CREATE TABLE todo.tasks (
 
 IF OBJECT_ID('todo.task_assignees', 'U') IS NULL
 CREATE TABLE todo.task_assignees (
-  task_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
+  task_id INT NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
   user_id NVARCHAR(36) NOT NULL,
   created_at DATETIME2(6) NOT NULL,
   PRIMARY KEY (task_id, user_id)
@@ -172,8 +197,8 @@ CREATE TABLE todo.task_assignees (
 
 IF OBJECT_ID('todo.labels', 'U') IS NULL
 CREATE TABLE todo.labels (
-  id NVARCHAR(36) PRIMARY KEY,
-  workspace_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.workspaces(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  workspace_id INT NOT NULL FOREIGN KEY REFERENCES todo.workspaces(id) ON DELETE CASCADE,
   name NVARCHAR(120) NOT NULL,
   color NVARCHAR(20) NOT NULL DEFAULT '#6c63ff',
   created_at DATETIME2(6) NOT NULL,
@@ -182,34 +207,36 @@ CREATE TABLE todo.labels (
 
 IF OBJECT_ID('todo.task_labels', 'U') IS NULL
 CREATE TABLE todo.task_labels (
-  task_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
-  label_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.labels(id) ON DELETE NO ACTION,
+  task_id INT NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
+  label_id INT NOT NULL FOREIGN KEY REFERENCES todo.labels(id) ON DELETE NO ACTION,
   PRIMARY KEY (task_id, label_id)
 );
 
 IF OBJECT_ID('todo.task_checklists', 'U') IS NULL
 CREATE TABLE todo.task_checklists (
-  id NVARCHAR(36) PRIMARY KEY,
-  task_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  task_id INT NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
   title NVARCHAR(160) NOT NULL,
+  position INT NOT NULL DEFAULT 0,
   created_at DATETIME2(6) NOT NULL,
   updated_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME()
 );
 
 IF OBJECT_ID('todo.task_checklist_items', 'U') IS NULL
 CREATE TABLE todo.task_checklist_items (
-  id NVARCHAR(36) PRIMARY KEY,
-  checklist_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.task_checklists(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  checklist_id INT NOT NULL FOREIGN KEY REFERENCES todo.task_checklists(id) ON DELETE CASCADE,
   title NVARCHAR(240) NOT NULL,
   completed BIT NOT NULL DEFAULT 0,
+  position INT NOT NULL DEFAULT 0,
   created_at DATETIME2(6) NOT NULL,
   updated_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME()
 );
 
 IF OBJECT_ID('todo.task_comments', 'U') IS NULL
 CREATE TABLE todo.task_comments (
-  id NVARCHAR(36) PRIMARY KEY,
-  task_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  task_id INT NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
   user_id NVARCHAR(36) NOT NULL,
   body NVARCHAR(MAX) NOT NULL,
   created_at DATETIME2(6) NOT NULL
@@ -217,8 +244,8 @@ CREATE TABLE todo.task_comments (
 
 IF OBJECT_ID('todo.task_attachments', 'U') IS NULL
 CREATE TABLE todo.task_attachments (
-  id NVARCHAR(36) PRIMARY KEY,
-  task_id NVARCHAR(36) NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  task_id INT NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
   user_id NVARCHAR(36) NOT NULL,
   file_name NVARCHAR(255) NOT NULL,
   s3_key NVARCHAR(500) NOT NULL,
@@ -230,18 +257,18 @@ CREATE TABLE todo.task_attachments (
 
 IF OBJECT_ID('todo.task_activity_logs', 'U') IS NULL
 CREATE TABLE todo.task_activity_logs (
-  id NVARCHAR(36) PRIMARY KEY,
+  id INT IDENTITY(1,1) PRIMARY KEY,
   user_id NVARCHAR(36) NOT NULL,
   action NVARCHAR(80) NOT NULL,
   entity_type NVARCHAR(80) NOT NULL,
-  entity_id NVARCHAR(36) NOT NULL,
+  entity_id NVARCHAR(50) NOT NULL,
   details NVARCHAR(MAX) NULL,
   created_at DATETIME2(6) NOT NULL
 );
 
 IF OBJECT_ID('todo.notifications', 'U') IS NULL
 CREATE TABLE todo.notifications (
-  id NVARCHAR(36) PRIMARY KEY,
+  id INT IDENTITY(1,1) PRIMARY KEY,
   user_id NVARCHAR(36) NOT NULL,
   type NVARCHAR(80) NOT NULL,
   title NVARCHAR(160) NOT NULL,
@@ -251,13 +278,59 @@ CREATE TABLE todo.notifications (
 );
 GO
 
-IF COL_LENGTH('todo.boards', 'background') IS NULL ALTER TABLE todo.boards ADD background NVARCHAR(500) NULL;
-IF COL_LENGTH('todo.boards', 'visibility') IS NULL ALTER TABLE todo.boards ADD visibility NVARCHAR(50) NOT NULL DEFAULT 'public';
-IF COL_LENGTH('todo.boards', 'access_code') IS NULL ALTER TABLE todo.boards ADD access_code NVARCHAR(50) NULL;
-IF COL_LENGTH('todo.boards', 'template') IS NULL ALTER TABLE todo.boards ADD template NVARCHAR(50) NULL;
-IF COL_LENGTH('todo.tasks', 'due_time') IS NULL ALTER TABLE todo.tasks ADD due_time NVARCHAR(20) NULL;
-IF COL_LENGTH('todo.tasks', 'due_reminder') IS NULL ALTER TABLE todo.tasks ADD due_reminder NVARCHAR(50) NULL;
-IF COL_LENGTH('todo.tasks', 'recurring') IS NULL ALTER TABLE todo.tasks ADD recurring NVARCHAR(50) NULL;
+IF OBJECT_ID('todo.column_members', 'U') IS NULL
+CREATE TABLE todo.column_members (
+  column_id INT NOT NULL FOREIGN KEY REFERENCES todo.board_columns(id) ON DELETE CASCADE,
+  user_id NVARCHAR(36) NOT NULL,
+  role NVARCHAR(50) NOT NULL DEFAULT 'view',
+  created_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME(),
+  PRIMARY KEY (column_id, user_id)
+);
+
+IF OBJECT_ID('todo.task_members', 'U') IS NULL
+CREATE TABLE todo.task_members (
+  task_id INT NOT NULL FOREIGN KEY REFERENCES todo.tasks(id) ON DELETE CASCADE,
+  user_id NVARCHAR(36) NOT NULL,
+  role NVARCHAR(50) NOT NULL DEFAULT 'view',
+  created_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME(),
+  PRIMARY KEY (task_id, user_id)
+);
+
+IF COL_LENGTH('todo.task_attachments', 'description') IS NULL
+  ALTER TABLE todo.task_attachments ADD description NVARCHAR(MAX) NULL;
+GO
+
+IF OBJECT_ID('todo.board_access', 'U') IS NULL
+CREATE TABLE todo.board_access (
+  board_id INT NOT NULL FOREIGN KEY REFERENCES todo.boards(id) ON DELETE CASCADE,
+  user_id NVARCHAR(36) NOT NULL,
+  board_view BIT NOT NULL DEFAULT 0,
+  board_delete BIT NOT NULL DEFAULT 0,
+  list_create BIT NOT NULL DEFAULT 0,
+  list_view BIT NOT NULL DEFAULT 0,
+  list_delete BIT NOT NULL DEFAULT 0,
+  card_create BIT NOT NULL DEFAULT 0,
+  card_view BIT NOT NULL DEFAULT 0,
+  card_delete BIT NOT NULL DEFAULT 0,
+  updated_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME(),
+  PRIMARY KEY (board_id, user_id)
+);
+GO
+
+IF OBJECT_ID('todo.workboard_permissions', 'U') IS NULL
+CREATE TABLE todo.workboard_permissions (
+  user_id NVARCHAR(36) NOT NULL PRIMARY KEY,
+  board_create BIT NOT NULL DEFAULT 1,
+  board_view BIT NOT NULL DEFAULT 1,
+  board_delete BIT NOT NULL DEFAULT 1,
+  list_create BIT NOT NULL DEFAULT 1,
+  list_view BIT NOT NULL DEFAULT 1,
+  list_delete BIT NOT NULL DEFAULT 1,
+  card_create BIT NOT NULL DEFAULT 1,
+  card_view BIT NOT NULL DEFAULT 1,
+  card_delete BIT NOT NULL DEFAULT 1,
+  updated_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME()
+);
 GO
 
 -- Boards are created under the first project; make sure one exists.
@@ -267,11 +340,11 @@ DECLARE @owner NVARCHAR(36) = (
 );
 
 IF NOT EXISTS (SELECT 1 FROM todo.workspaces)
-  INSERT INTO todo.workspaces (id, name, description, owner_id, created_at, updated_at)
-  VALUES ('00000000-0000-0000-0000-000000000002', N'evolv Project Workspace', N'', @owner, SYSUTCDATETIME(), SYSUTCDATETIME());
+  INSERT INTO todo.workspaces (name, description, owner_id, created_at, updated_at)
+  VALUES (N'Customer Portal Workspace', N'Workspace for portal projects', @owner, SYSUTCDATETIME(), SYSUTCDATETIME());
 
 IF NOT EXISTS (SELECT 1 FROM todo.projects)
-  INSERT INTO todo.projects (id, workspace_id, name, code, status, priority, manager_id, owner_id, created_at, updated_at)
-  SELECT TOP 1 '00000000-0000-0000-0000-000000000003', id, N'evolv Projects', 'EVOL', 'active', 'medium', @owner, @owner, SYSUTCDATETIME(), SYSUTCDATETIME()
+  INSERT INTO todo.projects (workspace_id, name, code, status, priority, manager_id, owner_id, created_at, updated_at)
+  SELECT TOP 1 id, N'Customer Portal', 'EVOL', 'active', 'medium', @owner, @owner, SYSUTCDATETIME(), SYSUTCDATETIME()
   FROM todo.workspaces ORDER BY created_at;
 GO

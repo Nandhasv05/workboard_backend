@@ -7,9 +7,12 @@ import {
   createTask, deleteTask, listTasks, moveTask, updateTask, 
   getTaskDetails, addComment, addChecklist, addChecklistItem, 
   toggleChecklistItem, deleteChecklistItem, deleteChecklist,
-  addAttachment, deleteAttachment, getUserInbox
+  addAttachment, deleteAttachment, updateAttachmentDescription, getUserInbox,
+  listTaskMembers, setTaskMembersAccess
 } from '../services/taskService.js';
 import { canOpenBoard } from '../services/boardService.js';
+import { requireColumnEdit, requireTaskEdit } from '../services/accessService.js';
+import { filterVisibleTasks, requireBoardPermission, requireColumnPermission, requireTaskPermission } from '../services/permissionService.js';
 
 export const taskRouter = Router();
 
@@ -19,22 +22,28 @@ taskRouter.get('/inbox/summary', async (req, res) => {
 });
 
 taskRouter.get('/', async (req, res) => {
+  const userId = (req as any).user?.id;
   const boardId = req.query.boardId as string | undefined;
-  if (boardId && !(await canOpenBoard(boardId, (req as any).user?.id))) {
+  if (boardId && !(await canOpenBoard(boardId, userId))) {
     throw new HttpError(403, 'This board is private. Enter the access code to open it.');
   }
-  res.json({ tasks: await listTasks(req.query.projectId as string, req.query.boardId as string) });
+  const tasks = await listTasks(req.query.projectId as string, req.query.boardId as string, userId);
+  res.json({ tasks: await filterVisibleTasks(userId, tasks) });
 });
 
-taskRouter.get('/:id', param('id').isUUID(), async (req, res) => {
+taskRouter.get('/:id', param('id').notEmpty(), async (req, res) => {
   const id = (req.params as { id: string }).id;
-  res.json({ task: await getTaskDetails(id) });
+  const userId = (req as any).user?.id;
+  await requireTaskPermission(userId, id, 'card_view');
+  const tasks = await filterVisibleTasks(userId, [await getTaskDetails(id, userId)]);
+  if (!tasks[0]) throw new HttpError(403, 'You do not have access to this card.');
+  res.json({ task: tasks[0] });
 });
 
 taskRouter.post(
   '/',
-  body('boardId').isString().notEmpty(),
-  body('projectId').isString().notEmpty(),
+  body('boardId').notEmpty(),
+  body('projectId').notEmpty(),
   body('title').trim().isLength({ min: 1, max: 240 }),
   (req, _res, next) => {
     const errors = validationResult(req);
@@ -42,30 +51,51 @@ taskRouter.post(
     next();
   },
   async (req, res) => {
-    res.status(201).json({ task: await createTask((req as any).user?.id || '1', req.body) });
+    const userId = (req as any).user?.id;
+    if (req.body.columnId) await requireColumnPermission(userId, req.body.columnId, 'card_create');
+    else await requireBoardPermission(userId, req.body.boardId, 'card_create');
+    if (req.body.columnId) await requireColumnEdit(req.body.columnId, userId);
+    res.status(201).json({ task: await createTask(userId || '1', req.body) });
   }
 );
 
 taskRouter.put('/:id', async (req, res) => {
   const id = (req.params as { id: string }).id;
   const userId = (req as any).user?.id || '1';
+  await requireTaskEdit(id, userId);
+  if (req.body.columnId) await requireColumnEdit(req.body.columnId, userId);
   res.json({ task: await updateTask(id, { ...req.body, userId }) });
 });
 
-taskRouter.patch('/:id/move', body('columnId').isString().notEmpty(), async (req, res) => {
+taskRouter.patch('/:id/move', body('columnId').notEmpty(), async (req, res) => {
   const id = (req.params as { id: string }).id;
   const userId = (req as any).user?.id || '1';
+  await requireTaskEdit(id, userId);
+  await requireColumnEdit(req.body.columnId, userId);
   res.json({ task: await moveTask(id, req.body.columnId, req.body.position ?? 0, userId) });
 });
 
 taskRouter.delete('/:id', async (req, res) => {
   const id = (req.params as { id: string }).id;
+  await requireTaskPermission((req as any).user?.id, id, 'card_delete');
+  await requireTaskEdit(id, (req as any).user?.id);
   await deleteTask(id);
   res.status(204).send();
 });
 
+taskRouter.get('/:id/members', param('id').notEmpty(), async (req, res) => {
+  const id = (req.params as { id: string }).id;
+  res.json(await listTaskMembers(id));
+});
+
+taskRouter.put('/:id/members', param('id').notEmpty(), async (req, res) => {
+  const id = (req.params as { id: string }).id;
+  await requireTaskEdit(id, (req as any).user?.id);
+  res.json(await setTaskMembersAccess(id, req.body.members || []));
+});
+
 // Attachments
-taskRouter.post('/:id/attachments', param('id').isUUID(), async (req, res) => {
+taskRouter.post('/:id/attachments', param('id').notEmpty(), async (req, res) => {
   const id = (req.params as { id: string }).id;
   const { fileName, fileType, dataUrl } = req.body;
   if (!dataUrl) {
@@ -94,18 +124,27 @@ taskRouter.post('/:id/attachments', param('id').isUUID(), async (req, res) => {
   fs.writeFileSync(filePath, buffer);
   const fileUrl = `/Workboard/TodoList/uploads/${safeName}`;
   const userId = (req as any).user?.id || '1';
+  await requireTaskEdit(id, userId);
 
   const attachment = await addAttachment(id, userId, fileName || cleanName, mime, buffer.length, fileUrl);
   res.status(201).json({ attachment });
 });
 
-taskRouter.delete('/:id/attachments/:attachmentId', param('id').isUUID(), param('attachmentId').isUUID(), async (req, res) => {
-  await deleteAttachment(req.params!.attachmentId);
+taskRouter.patch('/:id/attachments/:attachmentId', param('id').notEmpty(), param('attachmentId').notEmpty(), async (req, res) => {
+  const { id, attachmentId } = req.params as { id: string; attachmentId: string };
+  await requireTaskEdit(id, (req as any).user?.id);
+  res.json({ attachment: await updateAttachmentDescription(attachmentId, req.body.description ?? '') });
+});
+
+taskRouter.delete('/:id/attachments/:attachmentId', param('id').notEmpty(), param('attachmentId').notEmpty(), async (req, res) => {
+  const { id, attachmentId } = req.params as { id: string; attachmentId: string };
+  await requireTaskEdit(id, (req as any).user?.id);
+  await deleteAttachment(attachmentId);
   res.status(204).send();
 });
 
 // Comments
-taskRouter.post('/:id/comments', param('id').isUUID(), body('body').trim().isLength({ min: 1 }), async (req, res) => {
+taskRouter.post('/:id/comments', param('id').notEmpty(), body('body').trim().isLength({ min: 1 }), async (req, res) => {
   const id = (req.params as { id: string }).id;
   const userId = (req as any).user?.id || '1';
   const comment = await addComment(id, userId, req.body.body);
@@ -113,31 +152,31 @@ taskRouter.post('/:id/comments', param('id').isUUID(), body('body').trim().isLen
 });
 
 // Checklists
-taskRouter.post('/:id/checklists', param('id').isUUID(), body('title').trim().isLength({ min: 1 }), async (req, res) => {
+taskRouter.post('/:id/checklists', param('id').notEmpty(), body('title').trim().isLength({ min: 1 }), async (req, res) => {
   const id = (req.params as { id: string }).id;
   const userId = (req as any).user?.id || '1';
   const checklist = await addChecklist(id, req.body.title, userId);
   res.status(201).json({ checklist });
 });
 
-taskRouter.delete('/:id/checklists/:checklistId', param('id').isUUID(), param('checklistId').isUUID(), async (req, res) => {
+taskRouter.delete('/:id/checklists/:checklistId', param('id').notEmpty(), param('checklistId').notEmpty(), async (req, res) => {
   await deleteChecklist(req.params!.checklistId);
   res.status(204).send();
 });
 
-taskRouter.post('/:id/checklists/:checklistId/items', param('id').isUUID(), param('checklistId').isUUID(), body('title').trim().isLength({ min: 1 }), async (req, res) => {
+taskRouter.post('/:id/checklists/:checklistId/items', param('id').notEmpty(), param('checklistId').notEmpty(), body('title').trim().isLength({ min: 1 }), async (req, res) => {
   const userId = (req as any).user?.id || '1';
   const item = await addChecklistItem(req.params!.checklistId, req.body.title, userId);
   res.status(201).json({ item });
 });
 
-taskRouter.patch('/:id/checklists/items/:itemId', param('id').isUUID(), param('itemId').isUUID(), body('completed').isBoolean(), async (req, res) => {
+taskRouter.patch('/:id/checklists/items/:itemId', param('id').notEmpty(), param('itemId').notEmpty(), body('completed').isBoolean(), async (req, res) => {
   const userId = (req as any).user?.id || '1';
   const item = await toggleChecklistItem(req.params!.itemId, req.body.completed, userId);
   res.json({ item });
 });
 
-taskRouter.delete('/:id/checklists/items/:itemId', param('id').isUUID(), param('itemId').isUUID(), async (req, res) => {
+taskRouter.delete('/:id/checklists/items/:itemId', param('id').notEmpty(), param('itemId').notEmpty(), async (req, res) => {
   await deleteChecklistItem(req.params!.itemId);
   res.status(204).send();
 });

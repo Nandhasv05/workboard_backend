@@ -27,17 +27,22 @@ const getMssqlPool = async (): Promise<sql.ConnectionPool> => {
 };
 
 const TABLE_NAMES = [
-  'workspace_members', 'project_members', 'board_members', 'board_columns', 'task_assignees',
+  'workspace_members', 'project_members', 'board_members', 'column_members', 'task_members', 'board_columns', 'task_assignees',
   'task_labels', 'task_checklist_items', 'task_checklists', 'task_comments',
   'task_attachments', 'task_activity_logs', 'notifications', 'workspaces',
-  'projects', 'boards', 'tasks', 'labels', 'users'
+  'workboard_permissions', 'board_access', 'projects', 'boards', 'tasks', 'labels', 'users'
 ];
+
+// Production sets PORTAL_DB_* and reads dbo.users from that server (copied into portal_directory).
+// Dev leaves PORTAL_DB_HOST empty and reads dbo.users on DATABASE_HOST.
+const usersTable = env.portalDb ? 'portal_directory' : 'app_users';
 
 function transformForMssql(query: string): string {
   let q = query;
   for (const table of TABLE_NAMES) {
+    const target = table === 'users' ? usersTable : table;
     const regex = new RegExp(`\\b(FROM|JOIN|INTO|UPDATE|TABLE)\\s+(?!\\[?todo\\]?\\.)(\\[?${table}\\]?)\\b`, 'gi');
-    q = q.replace(regex, `$1 todo.$2`);
+    q = q.replace(regex, `$1 todo.${target}`);
   }
   q = q.replace(/=\s*"([^"]*)"/g, "='$1'");
   q = q.replace(/!=\s*"([^"]*)"/g, "<>'$1'");

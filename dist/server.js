@@ -5,7 +5,10 @@ import { poolEnd } from './database/pool.js';
 import { startPortalUserSync } from './services/portalUserSync.js';
 const app = createApp();
 const server = createServer(app);
-server.listen(env.port, () => console.log(`Orbit API listening on http://localhost:${env.port}`));
+server.listen(env.port, () => {
+    const users = env.portalDb ? `${env.portalDb.host} dbo.users` : `${env.database.host} dbo.users`;
+    console.log(`Orbit API listening on port ${env.port}; app tables ${env.database.host}; users ${users}`);
+});
 startPortalUserSync();
 const shutdown = async (signal) => {
     console.log(`${signal} received; closing database and HTTP connections.`);
